@@ -27,6 +27,10 @@ cd yuque-exporter
 ### 2. 安装依赖
 
 ```bash
+# Windows cmd 中执行（临时生效，仅本次安装有效），如果下载 puppeteer，执行下面的操作
+# 若用 PowerShell，执行：$env:PUPPETEER_SKIP_DOWNLOAD = "true"
+set PUPPETEER_SKIP_DOWNLOAD=true
+
 npm install
 ```
 
