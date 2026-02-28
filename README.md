@@ -1,6 +1,8 @@
 # Yuque Crawler (语雀知识库爬虫)
 
-这是一个基于 Node.js + Puppeteer 的语雀知识库爬虫工具。它可以将整个语雀知识库（Knowledge Base）导出为本地的 Markdown 文件，同时保持原有的目录结构，并自动下载文档中的图片到本地。
+这是一个基于 Node.js + Puppeteer 的语雀知识库爬虫工具。它可以将整个语雀知识库（Knowledge Base）导出为本地的 Markdown 文件，同时保持原有的目录结构，并自动下载文档中的图片到腾讯云COS。
+
+> 本项目基于 [大佬](https://github.com/xiyueyezibile/yuque-copy)项目基础上开发支持图片上传腾讯云。原因：发现下载的markdown文档中的图片无法正常导入飞书，最后发现自己有腾讯云对象存储，飞书也支持图片链接导入，就基于大模型在原有项目上进行了二次开发。
 
 ## ✨ 功能特性
 
@@ -18,8 +20,8 @@
 ### 1. 克隆项目
 
 ```bash
-git clone git@github.com:xiyueyezibile/yuque-copy.git
-cd url-to-others
+git clone https://github.com/tedburner/yuque-exporter.git
+cd yuque-exporter
 ```
 
 ### 2. 安装依赖

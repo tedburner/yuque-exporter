@@ -2,6 +2,7 @@ const puppeteer = require('puppeteer');
 const path = require('path');
 const fs = require('fs');
 const axios = require('axios');
+const COS = require('cos-nodejs-sdk-v5'); // 引入腾讯云 SDK
 const config = require('./config');
 const utils = require('./utils');
 const colors = require('colors');
@@ -12,12 +13,19 @@ class YuqueCrawler {
         this.page = null;
         this.onProgress = options.onProgress || (() => {});
         this.onLog = options.onLog || console.log;
+        
+        // 初始化腾讯云 COS 客户端
+        this.cos = new COS({
+            SecretId: config.cos.SecretId,
+            SecretKey: config.cos.SecretKey
+        });
     }
 
     async init() {
         this.onLog('正在启动浏览器...'.cyan);
         this.browser = await puppeteer.launch({
             headless: "new",
+            executablePath: 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe',
             args: [
                 '--no-sandbox', 
                 '--disable-setuid-sandbox', 
@@ -59,29 +67,20 @@ class YuqueCrawler {
         });
 
         if (!bookData) {
-            throw new Error('无法获取知识库信息(window.appData.book)，请检查 URL 或 Cookie。');
+            throw new Error('无法获取知识库信息，请检查 URL 或 Cookie。');
         }
 
         return bookData;
     }
 
-    // 使用 axios 直接调用 API，不依赖 puppeteer 页面上下文
     async fetchMarkdownApi(bookId, slug) {
         const apiUrl = `https://www.yuque.com/api/docs/${slug}?book_id=${bookId}&merge_dynamic_data=false&mode=markdown`;
-        const headers = {
-            'User-Agent': config.userAgent
-        };
-        if (config.cookie) {
-            headers['Cookie'] = config.cookie;
-        }
+        const headers = { 'User-Agent': config.userAgent };
+        if (config.cookie) { headers['Cookie'] = config.cookie; }
 
         for (let i = 0; i < config.retry; i++) {
             try {
-                const response = await axios.get(apiUrl, { 
-                    headers, 
-                    timeout: config.timeout 
-                });
-                
+                const response = await axios.get(apiUrl, { headers, timeout: config.timeout });
                 if (response.data && response.data.data) {
                     return response.data.data.sourcecode || '';
                 }
@@ -93,65 +92,82 @@ class YuqueCrawler {
         }
     }
 
+    /**
+     * 下载图片并上传至腾讯云 COS
+     */
+    async uploadToCOS(imgUrl) {
+        try {
+            // 1. 下载图片二进制数据
+            const response = await axios.get(imgUrl, {
+                responseType: 'arraybuffer',
+                timeout: config.timeout,
+                headers: { 
+                    'User-Agent': config.userAgent,
+                    'Referer': 'https://www.yuque.com/' 
+                }
+            });
+
+            // 2. 生成唯一文件名 (保留原始后缀或默认为 .png)
+            const filename = utils.getLocalFilename(imgUrl);
+            const cosPath = `yuque_images/${filename}`; // COS 中的存储路径
+
+            // 3. 上传至 COS
+            const uploadResult = await new Promise((resolve, reject) => {
+                this.cos.putObject({
+                    Bucket: config.cos.Bucket,
+                    Region: config.cos.Region,
+                    Key: cosPath,
+                    Body: Buffer.from(response.data),
+                    ContentType: response.headers['content-type']
+                }, (err, data) => {
+                    if (err) reject(err);
+                    else resolve(data);
+                });
+            });
+
+            // 4. 返回 COS 的访问 URL (拼接方式根据是否有自定义域名决定)
+            return `https://${uploadResult.Location}`;
+        } catch (e) {
+            this.onLog(`图片上传 COS 失败: ${imgUrl} -> ${e.message}`.yellow);
+            return null;
+        }
+    }
+
     async processDocument(bookId, slug, savePath) {
         let markdownContent = '';
-
         try {
-            // 使用 axios 获取内容
             const sourceCode = await this.fetchMarkdownApi(bookId, slug);
             markdownContent = sourceCode;
-
-            if (!markdownContent) {
-                // 如果内容为空，返回 false 表示未保存
-                return false;
-            }
+            if (!markdownContent) return false;
         } catch (e) {
-            // 获取失败视为未保存
             return false;
         }
 
-        // 2. 处理图片
-        const mdDir = path.dirname(savePath);
-        const imagesDir = path.join(mdDir, 'images');
-        
         const mdImgRegex = /!\[([^\]]*)\]\((https?[^)]+)\)/g;
         const htmlImgRegex = /<img[^>]*?src=["'](https?[^"']+)["']/g;
         
-        const imagesToDownload = [];
+        const imageUrls = new Set();
         let match;
-        while ((match = mdImgRegex.exec(markdownContent)) !== null) {
-            imagesToDownload.push({ url: match[2], isHtml: false });
-        }
-        while ((match = htmlImgRegex.exec(markdownContent)) !== null) {
-            imagesToDownload.push({ url: match[1], isHtml: true });
-        }
+        while ((match = mdImgRegex.exec(markdownContent)) !== null) imageUrls.add(match[2]);
+        while ((match = htmlImgRegex.exec(markdownContent)) !== null) imageUrls.add(match[1]);
 
-        const uniqueImages = [...new Set(imagesToDownload.map(i => i.url))];
-        
-        if (uniqueImages.length > 0) {
-            utils.ensureDir(imagesDir);
-            for (const imgUrl of uniqueImages) {
-                const filename = utils.getLocalFilename(imgUrl);
-                const localAbsPath = path.join(imagesDir, filename);
-                const localRelPath = `images/${filename}`;
-
-                try {
-                    await utils.downloadFile(imgUrl, localAbsPath);
-                    markdownContent = markdownContent.split(imgUrl).join(localRelPath);
-                } catch (e) {
-                    // 图片下载失败，暂不中断流程
-                }
+        // 替换为腾讯云 URL
+        for (const imgUrl of imageUrls) {
+            const cosUrl = await this.uploadToCOS(imgUrl);
+            if (cosUrl) {
+                const escapedUrl = imgUrl.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                const replaceRegex = new RegExp(escapedUrl, 'g');
+                markdownContent = markdownContent.replace(replaceRegex, cosUrl);
             }
         }
 
-        // 3. 保存文件
+        const mdDir = path.dirname(savePath);
         utils.ensureDir(mdDir);
-        fs.writeFileSync(savePath, markdownContent);
+        fs.writeFileSync(savePath, markdownContent, 'utf-8');
         return true;
     }
 
     async start() {
-        // 动态引入 p-limit
         const pLimit = (await import('p-limit')).default;
         const limit = pLimit(config.concurrency || 5);
 
@@ -159,26 +175,19 @@ class YuqueCrawler {
 
         try {
             const bookData = await this.fetchBookInfo();
-            // 获取完信息后可以关闭浏览器，因为后续 API 调用走 axios
             await this.close(); 
-            this.browser = null; // 置空防止 finally 再次关闭
+            this.browser = null;
 
             const bookId = bookData.id;
             const bookName = utils.sanitizeName(bookData.name);
             const toc = bookData.toc || [];
 
-            this.onLog(`成功识别知识库: [${bookName}] (ID: ${bookId})`.green.bold);
-            this.onLog(`目录条目数: ${toc.length}`.blue);
-            this.onLog(`并发数: ${config.concurrency}`.magenta);
-
+            this.onLog(`成功识别知识库: [${bookName}]`.green.bold);
             const bookRootDir = path.join(config.outputRoot, bookName);
             utils.ensureDir(bookRootDir);
 
-            // 解析目录结构
             const nodeMap = {};
-            toc.forEach(item => {
-                nodeMap[item.uuid] = { ...item };
-            });
+            toc.forEach(item => { nodeMap[item.uuid] = { ...item }; });
 
             const getPath = (uuid) => {
                 const node = nodeMap[uuid];
@@ -188,89 +197,52 @@ class YuqueCrawler {
                 return path.join(getPath(node.parent_uuid), safeTitle);
             };
 
-            
-            // 筛选出需要下载的文档
             const docItems = toc.filter(item => item.url && item.url.length > 0);
-            const totalDocs = docItems.length;
             let completedCount = 0;
+            this.onProgress('start', docItems.length);
 
-            // 初始化进度条
-            this.onProgress('start', totalDocs);
-
-            // 构建任务列表
-            const tasks = [];
-            // 用于记录每个 doc 是否成功保存
-            const docStatusMap = new Map(); // uuid -> boolean
-
-            for (const item of toc) {
+            const docStatusMap = new Map();
+            const tasks = toc.map(item => limit(async () => {
                 const itemPath = getPath(item.uuid);
-                const isDoc = item.url && item.url.length > 0;
-                
-                if (isDoc) {
-                    const fileName = `${itemPath}.md`;
-                    const absFilePath = path.join(bookRootDir, fileName);
-
-                    // 添加并发任务
-                    tasks.push(limit(async () => {
-                        try {
-                            const saved = await this.processDocument(bookId, item.url, absFilePath);
-                            docStatusMap.set(item.uuid, saved);
-                        } catch (error) {
-                            this.onLog(`\n[Error] ${item.title}: ${error.message}`.red);
-                            docStatusMap.set(item.uuid, false);
-                        } finally {
-                            completedCount++;
-                            this.onProgress('update', completedCount, { 
-                                file: item.title, // 显示当前完成的文件
-                                status: 'Done' 
-                            });
-                        }
-                    }));
+                if (item.url && item.url.length > 0) {
+                    const absFilePath = path.join(bookRootDir, `${itemPath}.md`);
+                    try {
+                        const saved = await this.processDocument(bookId, item.url, absFilePath);
+                        docStatusMap.set(item.uuid, saved);
+                    } catch (error) {
+                        docStatusMap.set(item.uuid, false);
+                    } finally {
+                        completedCount++;
+                        this.onProgress('update', completedCount, { file: item.title, status: 'Done' });
+                    }
                 } else {
-                    // 非文档节点，确保目录存在
-                    const dirPath = path.join(bookRootDir, itemPath);
-                    utils.ensureDir(dirPath);
+                    utils.ensureDir(path.join(bookRootDir, itemPath));
                 }
-            }
+            }));
 
-            // 等待所有任务完成
             await Promise.all(tasks);
-
             this.onProgress('stop');
 
-            // --- 第二次遍历：生成 SUMMARY.md ---
+            // 生成 SUMMARY.md
             const summaryLines = ['# Summary\n'];
             for (const item of toc) {
                 const itemPath = getPath(item.uuid);
-                const isDoc = item.url && item.url.length > 0;
-                
                 const depth = itemPath.split(path.sep).length - 1;
                 const indent = '  '.repeat(depth);
-
-                // 判断是否应该生成链接
-                // 只有当它是 Doc 并且成功保存了文件时，才生成链接
-                const saved = docStatusMap.get(item.uuid);
-                const shouldLink = isDoc && saved;
-
-                if (shouldLink) {
-                    const fileName = `${itemPath}.md`;
-                    const relLink = fileName.split(path.sep).join('/');
+                if (item.url && docStatusMap.get(item.uuid)) {
+                    const relLink = itemPath.split(path.sep).join('/') + '.md';
                     summaryLines.push(`${indent}* [${item.title}](${encodeURI(relLink)})`);
                 } else {
-                    // 否则只作为纯文本节点
                     summaryLines.push(`${indent}* ${item.title}`);
                 }
             }
-
             fs.writeFileSync(path.join(bookRootDir, 'SUMMARY.md'), summaryLines.join('\n'));
-            this.onLog(`SUMMARY.md 已生成`.green);
+            this.onLog(`任务完成，图片已上传至腾讯云 COS。`.green);
 
         } catch (error) {
             this.onLog(`全局错误: ${error.message}`.red);
         } finally {
-            if (this.browser) {
-                await this.close();
-            }
+            if (this.browser) await this.close();
         }
     }
 }

@@ -20,5 +20,12 @@ module.exports = {
     
     // 浏览器配置
     userAgent: 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    windowSize: '1920,1080'
+    windowSize: '1920,1080',
+    // 腾讯云COS
+    cos: {
+        SecretId: 'SecretId',
+        SecretKey: 'SecretKey',
+        Bucket: 'Bucket', // 存储桶名称
+        Region: 'ap-shanghai' // 存储桶地域:Region
+    },
 };
